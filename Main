@@ -1,0 +1,979 @@
+import io
+import re
+import math
+import tempfile
+import webbrowser
+from dataclasses import dataclass
+from datetime import datetime, date
+from typing import Dict, List, Optional, Tuple
+
+import pandas as pd
+import numpy as np
+
+import plotly.express as px
+import plotly.graph_objects as go
+
+import ttkbootstrap as ttk
+from ttkbootstrap.constants import *
+from tkinter import filedialog
+
+from openpyxl import Workbook
+from openpyxl.utils import get_column_letter
+
+from pptx import Presentation
+from pptx.util import Inches, Pt
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def _clean_str(x) -> str:
+    if pd.isna(x):
+        return ""
+    return str(x).strip()
+
+
+def _to_datetime(series: pd.Series) -> pd.Series:
+    return pd.to_datetime(series, errors="coerce")
+
+
+def _pct(part: float, whole: float) -> float:
+    return 0.0 if whole == 0 else (part / whole) * 100.0
+
+
+def _safe_median(series: pd.Series) -> float:
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    return float(s.median()) if not s.empty else float("nan")
+
+
+def _safe_mean(series: pd.Series) -> float:
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    return float(s.mean()) if not s.empty else float("nan")
+
+
+def _fmt_days(x: float) -> str:
+    if x is None or (isinstance(x, float) and math.isnan(x)):
+        return "—"
+    if x < 1:
+        return f"{int(round(x * 24))}h"
+    return f"{x:.1f}d"
+
+
+def _fit_columns(ws):
+    # Basic autosize for openpyxl
+    for col in ws.columns:
+        max_len = 0
+        col_letter = get_column_letter(col[0].column)
+        for cell in col:
+            try:
+                max_len = max(max_len, len(str(cell.value)) if cell.value is not None else 0)
+            except Exception:
+                pass
+        ws.column_dimensions[col_letter].width = min(max_len + 2, 60)
+
+
+# -----------------------------
+# Column detection
+# -----------------------------
+@dataclass
+class ColMap:
+    key: Optional[str] = None
+    summary: Optional[str] = None
+    status: Optional[str] = None
+    priority: Optional[str] = None
+    assignee: Optional[str] = None
+    reporter: Optional[str] = None
+    issue_type: Optional[str] = None
+    project: Optional[str] = None
+    created: Optional[str] = None
+    updated: Optional[str] = None
+    resolved: Optional[str] = None
+    due: Optional[str] = None
+    labels: Optional[str] = None
+    components: Optional[str] = None
+    resolution: Optional[str] = None
+    sla_breached: Optional[str] = None
+    sla_target: Optional[str] = None
+    sla_elapsed: Optional[str] = None
+
+
+def detect_columns(df: pd.DataFrame) -> ColMap:
+    # Normalise headers for matching
+    norm = {c: re.sub(r"\s+", " ", c.strip().lower()) for c in df.columns}
+
+    def pick(*candidates: str) -> Optional[str]:
+        for cand in candidates:
+            c = cand.strip().lower()
+            # exact
+            for orig, n in norm.items():
+                if n == c:
+                    return orig
+            # contains
+            for orig, n in norm.items():
+                if c in n:
+                    return orig
+        return None
+
+    cm = ColMap(
+        key=pick("issue key", "key"),
+        summary=pick("summary"),
+        status=pick("status"),
+        priority=pick("priority"),
+        assignee=pick("assignee", "assignee name"),
+        reporter=pick("reporter", "reporter name"),
+        issue_type=pick("issue type", "type"),
+        project=pick("project name", "project", "project key"),
+        created=pick("created", "created date"),
+        updated=pick("updated", "updated date"),
+        resolved=pick("resolved", "resolution date", "resolved date"),
+        due=pick("due date", "due"),
+        labels=pick("labels", "label"),
+        components=pick("component/s", "components", "component"),
+        resolution=pick("resolution"),
+    )
+
+    # SLA best-effort (plugins vary)
+    cm.sla_breached = pick("sla breached", "breached", "time to resolution (sla) breached")
+    cm.sla_target = pick("sla target", "goal", "time to resolution (sla) goal")
+    cm.sla_elapsed = pick("sla elapsed", "elapsed", "time to resolution (sla) elapsed")
+    return cm
+
+
+def normalize(df: pd.DataFrame, cm: ColMap) -> pd.DataFrame:
+    out = df.copy()
+
+    def col_or_blank(colname: Optional[str]) -> pd.Series:
+        if colname and colname in out.columns:
+            return out[colname]
+        return pd.Series([""] * len(out))
+
+    out["_key"] = col_or_blank(cm.key).astype(str).replace({"": np.nan})
+    out["_summary"] = col_or_blank(cm.summary).astype(str)
+    out["_status"] = col_or_blank(cm.status).astype(str).replace({"": np.nan})
+    out["_priority"] = col_or_blank(cm.priority).astype(str).replace({"": np.nan})
+    out["_assignee"] = col_or_blank(cm.assignee).astype(str).replace({"": np.nan})
+    out["_reporter"] = col_or_blank(cm.reporter).astype(str).replace({"": np.nan})
+    out["_issue_type"] = col_or_blank(cm.issue_type).astype(str).replace({"": np.nan})
+    out["_project"] = col_or_blank(cm.project).astype(str).replace({"": np.nan})
+    out["_resolution"] = col_or_blank(cm.resolution).astype(str).replace({"": np.nan})
+
+    out["_created"] = _to_datetime(col_or_blank(cm.created))
+    out["_updated"] = _to_datetime(col_or_blank(cm.updated))
+    out["_resolved"] = _to_datetime(col_or_blank(cm.resolved))
+    out["_due"] = _to_datetime(col_or_blank(cm.due))
+
+    # SLA
+    out["_sla_breached"] = col_or_blank(cm.sla_breached).astype(str)
+    out["_sla_target"] = col_or_blank(cm.sla_target).astype(str)
+    out["_sla_elapsed"] = col_or_blank(cm.sla_elapsed).astype(str)
+
+    today = pd.Timestamp(datetime.now().date())
+    out["_is_resolved"] = out["_resolved"].notna()
+    out["_is_open"] = ~out["_is_resolved"]
+
+    out["_age_days"] = (today - out["_created"]).dt.days
+    out["_age_days"] = out["_age_days"].where(out["_created"].notna(), np.nan)
+
+    out["_cycle_days"] = (out["_resolved"] - out["_created"]).dt.total_seconds() / 86400.0
+    out["_cycle_days"] = out["_cycle_days"].where(out["_is_resolved"], np.nan)
+
+    out["_created_month"] = out["_created"].dt.to_period("M").astype(str)
+    out["_resolved_month"] = out["_resolved"].dt.to_period("M").astype(str)
+
+    return out
+
+
+# -----------------------------
+# Analytics
+# -----------------------------
+def compute_kpis(df: pd.DataFrame) -> Dict[str, float]:
+    total = len(df)
+    open_cnt = int(df["_is_open"].sum()) if "_is_open" in df.columns else 0
+    resolved_cnt = int(df["_is_resolved"].sum()) if "_is_resolved" in df.columns else 0
+
+    median_age_open = _safe_median(df.loc[df["_is_open"], "_age_days"]) if total else float("nan")
+    median_cycle = _safe_median(df["_cycle_days"]) if total else float("nan")
+    mean_cycle = _safe_mean(df["_cycle_days"]) if total else float("nan")
+
+    # High priority heuristic
+    high_pri = 0
+    if "_priority" in df.columns:
+        high_pri = int(df["_priority"].astype(str).str.contains(r"highest|high|p1|p2|critical|urgent", case=False, na=False).sum())
+
+    # SLA breach heuristic
+    sla_breaches = 0
+    if "_sla_breached" in df.columns:
+        sla_breaches = int(df["_sla_breached"].astype(str).str.contains(r"true|breach|yes", case=False, na=False).sum())
+
+    # Backlog health score (0-100) heuristic:
+    # - penalize high % >30d open
+    # - penalize high priority open
+    # - penalize SLA breaches
+    score = 100.0
+    if total > 0:
+        open_df = df[df["_is_open"]].copy()
+        old_open = int((open_df["_age_days"] >= 30).sum()) if not open_df.empty else 0
+        pct_old = _pct(old_open, max(len(open_df), 1))
+        score -= min(50.0, pct_old * 0.8)      # up to -50
+        score -= min(25.0, high_pri * 1.0)     # up to -25
+        score -= min(25.0, sla_breaches * 2.0) # up to -25
+        score = max(0.0, min(100.0, score))
+
+    return {
+        "total": total,
+        "open": open_cnt,
+        "resolved": resolved_cnt,
+        "open_pct": _pct(open_cnt, total),
+        "resolved_pct": _pct(resolved_cnt, total),
+        "high_priority": high_pri,
+        "sla_breaches": sla_breaches,
+        "median_age_open": median_age_open,
+        "median_cycle": median_cycle,
+        "mean_cycle": mean_cycle,
+        "health_score": score,
+    }
+
+
+def aging_buckets(df: pd.DataFrame) -> pd.DataFrame:
+    open_df = df[df["_is_open"] & df["_age_days"].notna()].copy()
+    if open_df.empty:
+        return pd.DataFrame({"Bucket": [], "Count": []})
+
+    bins = [-1, 7, 14, 30, 60, 90, 180, 10_000]
+    labels = ["0-7d", "8-14d", "15-30d", "31-60d", "61-90d", "91-180d", "180d+"]
+    open_df["Bucket"] = pd.cut(open_df["_age_days"], bins=bins, labels=labels)
+    vc = open_df["Bucket"].value_counts().reindex(labels, fill_value=0).reset_index()
+    vc.columns = ["Bucket", "Count"]
+    return vc
+
+
+def created_vs_resolved_monthly(df: pd.DataFrame) -> pd.DataFrame:
+    created = df["_created_month"].value_counts().sort_index()
+    resolved = df["_resolved_month"].value_counts().sort_index()
+    idx = sorted(set(created.index.tolist()) | set(resolved.index.tolist()))
+    out = pd.DataFrame({
+        "Month": idx,
+        "Created": [int(created.get(i, 0)) for i in idx],
+        "Resolved": [int(resolved.get(i, 0)) for i in idx],
+    })
+    return out
+
+
+def exec_tables(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+    cols = ["_key", "_summary", "_project", "_issue_type", "_priority", "_status", "_assignee", "_created", "_age_days"]
+    open_df = df[df["_is_open"]].copy()
+
+    oldest_open = open_df.sort_values("_age_days", ascending=False).head(25)[cols] if not open_df.empty else pd.DataFrame(columns=cols)
+
+    high_pri_open = open_df[
+        open_df["_priority"].astype(str).str.contains(r"highest|high|p1|p2|critical|urgent", case=False, na=False)
+    ].sort_values("_age_days", ascending=False).head(25)[cols] if not open_df.empty else pd.DataFrame(columns=cols)
+
+    unassigned = open_df[open_df["_assignee"].isna()].sort_values("_age_days", ascending=False).head(25)[cols] if not open_df.empty else pd.DataFrame(columns=cols)
+
+    sla_breaches = pd.DataFrame()
+    if "_sla_breached" in df.columns:
+        bre = df[df["_sla_breached"].astype(str).str.contains(r"true|breach|yes", case=False, na=False)].copy()
+        if not bre.empty:
+            sla_breaches = bre[cols + ["_sla_breached", "_sla_target", "_sla_elapsed"]].head(50)
+
+    return {
+        "Oldest Open (Top 25)": oldest_open,
+        "High Priority Open (Top 25)": high_pri_open,
+        "Unassigned Open (Top 25)": unassigned,
+        "SLA Breaches (Best Effort)": sla_breaches,
+    }
+
+
+# -----------------------------
+# Plotly dashboard building
+# -----------------------------
+def build_figures(df: pd.DataFrame) -> Dict[str, go.Figure]:
+    figs: Dict[str, go.Figure] = {}
+
+    # Status (clean horizontal)
+    status_counts = df["_status"].fillna("Unknown").value_counts().reset_index()
+    status_counts.columns = ["Status", "Count"]
+    figs["Tickets by Status"] = px.bar(status_counts, y="Status", x="Count", orientation="h", title="Tickets by Status")
+
+    # Priority
+    pri_counts = df["_priority"].fillna("Unknown").value_counts().reset_index()
+    pri_counts.columns = ["Priority", "Count"]
+    figs["Tickets by Priority"] = px.bar(pri_counts, x="Priority", y="Count", title="Tickets by Priority")
+
+    # Assignee workload (open)
+    open_df = df[df["_is_open"]].copy()
+    ass_counts = open_df["_assignee"].fillna("Unassigned").value_counts().head(15).reset_index()
+    ass_counts.columns = ["Assignee", "Open Tickets"]
+    figs["Open Workload by Assignee"] = px.bar(ass_counts, x="Assignee", y="Open Tickets", title="Open Workload by Assignee (Top 15)")
+
+    # Created vs resolved
+    cr = created_vs_resolved_monthly(df)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=cr["Month"], y=cr["Created"], mode="lines+markers", name="Created"))
+    fig.add_trace(go.Scatter(x=cr["Month"], y=cr["Resolved"], mode="lines+markers", name="Resolved"))
+    fig.update_layout(title="Created vs Resolved (Monthly)", xaxis_title="Month", yaxis_title="Count")
+    figs["Created vs Resolved (Monthly)"] = fig
+
+    # Aging buckets
+    ab = aging_buckets(df)
+    figs["Open Ticket Aging Buckets"] = px.bar(ab, x="Bucket", y="Count", title="Open Ticket Aging Buckets")
+
+    # Cycle time distribution (if available)
+    if df["_cycle_days"].dropna().empty:
+        figs["Cycle Time Distribution"] = go.Figure().update_layout(title="Cycle Time Distribution (No resolved dates)")
+    else:
+        figs["Cycle Time Distribution"] = px.histogram(df.dropna(subset=["_cycle_days"]), x="_cycle_days", nbins=30, title="Cycle Time Distribution (Days)")
+        figs["Cycle Time Distribution"].update_xaxes(title="Days")
+
+    return figs
+
+
+def build_html_dashboard(kpi: Dict[str, float], figs: Dict[str, go.Figure], tables: Dict[str, pd.DataFrame], filters: Dict[str, str]) -> str:
+    # KPI cards
+    cards = f"""
+    <div class="kpi">
+      <div class="card"><div class="label">Total</div><div class="value">{kpi['total']}</div></div>
+      <div class="card"><div class="label">Open</div><div class="value">{kpi['open']}</div><div class="sub">{kpi['open_pct']:.1f}%</div></div>
+      <div class="card"><div class="label">Resolved</div><div class="value">{kpi['resolved']}</div><div class="sub">{kpi['resolved_pct']:.1f}%</div></div>
+      <div class="card"><div class="label">High Priority</div><div class="value">{int(kpi['high_priority'])}</div></div>
+      <div class="card"><div class="label">SLA Breaches</div><div class="value">{int(kpi['sla_breaches'])}</div></div>
+      <div class="card"><div class="label">Backlog Health</div><div class="value">{kpi['health_score']:.0f}</div><div class="sub">/ 100</div></div>
+      <div class="card"><div class="label">Median Open Age</div><div class="value">{_fmt_days(kpi['median_age_open'])}</div></div>
+      <div class="card"><div class="label">Median Cycle</div><div class="value">{_fmt_days(kpi['median_cycle'])}</div></div>
+    </div>
+    """
+
+    # Filters summary
+    filter_lines = "".join([f"<li><b>{k}</b>: {v}</li>" for k, v in filters.items() if v])
+    filters_html = f"""
+    <div class="panel">
+      <h2>Applied Filters</h2>
+      <ul>{filter_lines or "<li>None</li>"}</ul>
+    </div>
+    """
+
+    # Charts
+    chart_html = ""
+    for name, fig in figs.items():
+        # include plotlyjs once via CDN in first chart; rest no
+        chart_html += f'<div class="panel"><h2>{name}</h2>{fig.to_html(full_html=False, include_plotlyjs="cdn")}</div>'
+
+    # Tables (top 2 only to keep dashboard clean)
+    def df_to_html_table(tdf: pd.DataFrame, max_rows: int = 15) -> str:
+        if tdf is None or tdf.empty:
+            return "<p>No rows.</p>"
+        tmp = tdf.head(max_rows).copy()
+        tmp.columns = [c.lstrip("_").replace("_", " ").title() for c in tmp.columns]
+        # format dates
+        for c in tmp.columns:
+            if "Created" in c and pd.api.types.is_datetime64_any_dtype(tmp[c]):
+                tmp[c] = tmp[c].dt.strftime("%Y-%m-%d")
+        return tmp.to_html(index=False, escape=True)
+
+    oldest_tbl = df_to_html_table(tables.get("Oldest Open (Top 25)"))
+    highpri_tbl = df_to_html_table(tables.get("High Priority Open (Top 25)"))
+
+    tables_html = f"""
+    <div class="grid2">
+      <div class="panel"><h2>Oldest Open (Top 15)</h2>{oldest_tbl}</div>
+      <div class="panel"><h2>High Priority Open (Top 15)</h2>{highpri_tbl}</div>
+    </div>
+    """
+
+    html = f"""
+    <html>
+    <head>
+      <meta charset="utf-8"/>
+      <title>JIRA Executive Dashboard</title>
+      <style>
+        body {{
+          font-family: Segoe UI, Arial, sans-serif;
+          margin: 28px;
+          background: #f5f7fb;
+          color: #111;
+        }}
+        h1 {{
+          margin: 0 0 8px 0;
+          text-align: center;
+          font-size: 28px;
+        }}
+        .subhead {{
+          text-align: center;
+          color: #555;
+          margin-bottom: 18px;
+        }}
+        .kpi {{
+          display: grid;
+          grid-template-columns: repeat(4, minmax(180px, 1fr));
+          gap: 14px;
+          margin-bottom: 18px;
+        }}
+        .card {{
+          background: white;
+          border-radius: 14px;
+          padding: 14px 14px;
+          box-shadow: 0 8px 22px rgba(16,24,40,0.08);
+          border: 1px solid rgba(16,24,40,0.06);
+        }}
+        .label {{
+          font-size: 12px;
+          color: #64748b;
+          letter-spacing: 0.4px;
+          text-transform: uppercase;
+        }}
+        .value {{
+          font-size: 26px;
+          font-weight: 700;
+          margin-top: 6px;
+        }}
+        .sub {{
+          color: #64748b;
+          margin-top: 2px;
+          font-size: 12px;
+        }}
+        .panel {{
+          background: white;
+          border-radius: 14px;
+          padding: 16px;
+          box-shadow: 0 8px 22px rgba(16,24,40,0.08);
+          border: 1px solid rgba(16,24,40,0.06);
+          margin-bottom: 14px;
+        }}
+        .panel h2 {{
+          margin: 0 0 10px 0;
+          font-size: 16px;
+        }}
+        .grid2 {{
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: 14px;
+          margin-top: 10px;
+        }}
+        table {{
+          width: 100%;
+          border-collapse: collapse;
+          font-size: 12px;
+        }}
+        th, td {{
+          border-bottom: 1px solid #eaeef5;
+          text-align: left;
+          padding: 8px 6px;
+          vertical-align: top;
+        }}
+        th {{
+          color: #334155;
+          font-size: 12px;
+          background: #f8fafc;
+        }}
+        @media (max-width: 1100px) {{
+          .kpi {{ grid-template-columns: repeat(2, 1fr); }}
+          .grid2 {{ grid-template-columns: 1fr; }}
+        }}
+      </style>
+    </head>
+    <body>
+      <h1>JIRA Executive Dashboard</h1>
+      <div class="subhead">Generated locally • {datetime.now().strftime("%Y-%m-%d %H:%M")}</div>
+      {cards}
+      {filters_html}
+      {tables_html}
+      {chart_html}
+    </body>
+    </html>
+    """
+    return html
+
+
+# -----------------------------
+# Exports
+# -----------------------------
+def export_excel(path: str, kpi: Dict[str, float], filters: Dict[str, str], tables: Dict[str, pd.DataFrame]) -> None:
+    wb = Workbook()
+
+    # KPIs
+    ws = wb.active
+    ws.title = "KPIs"
+    ws.append(["Metric", "Value"])
+    ws.append(["Total tickets", kpi["total"]])
+    ws.append(["Open tickets", kpi["open"]])
+    ws.append(["Resolved tickets", kpi["resolved"]])
+    ws.append(["High priority (heuristic)", int(kpi["high_priority"])])
+    ws.append(["SLA breaches (best effort)", int(kpi["sla_breaches"])])
+    ws.append(["Median open age (days)", kpi["median_age_open"]])
+    ws.append(["Median cycle time (days)", kpi["median_cycle"]])
+    ws.append(["Mean cycle time (days)", kpi["mean_cycle"]])
+    ws.append(["Backlog health score (0-100)", kpi["health_score"]])
+    _fit_columns(ws)
+
+    # Filters
+    ws2 = wb.create_sheet("Filters")
+    ws2.append(["Filter", "Selection"])
+    for k, v in filters.items():
+        ws2.append([k, v])
+    _fit_columns(ws2)
+
+    # Tables
+    for name, tdf in tables.items():
+        safe = re.sub(r"[\[\]\*\/\\\?\:]", "-", name)[:31]
+        ws_t = wb.create_sheet(safe)
+        if tdf is None or tdf.empty:
+            ws_t.append(["Info"])
+            ws_t.append(["No rows"])
+            _fit_columns(ws_t)
+            continue
+
+        out = tdf.copy()
+        out.columns = [c.lstrip("_").replace("_", " ").title() for c in out.columns]
+        ws_t.append(list(out.columns))
+        for _, row in out.iterrows():
+            vals = []
+            for v in row.values:
+                if isinstance(v, pd.Timestamp):
+                    vals.append(v.strftime("%Y-%m-%d"))
+                else:
+                    vals.append("" if pd.isna(v) else v)
+            ws_t.append(vals)
+        _fit_columns(ws_t)
+
+    wb.save(path)
+
+
+def _fig_to_png_bytes(fig: go.Figure, width: int = 1400, height: int = 800) -> bytes:
+    # Requires kaleido installed
+    return fig.to_image(format="png", width=width, height=height, scale=2)
+
+
+def export_pptx(path: str, kpi: Dict[str, float], filters: Dict[str, str], figs: Dict[str, go.Figure]) -> None:
+    prs = Presentation()
+    prs.slide_width = Inches(13.33)
+    prs.slide_height = Inches(7.5)
+
+    def add_title(slide, title: str, subtitle: str = ""):
+        tb = slide.shapes.add_textbox(Inches(0.7), Inches(0.3), Inches(12.0), Inches(0.6))
+        tf = tb.text_frame
+        tf.clear()
+        p = tf.paragraphs[0]
+        r = p.add_run()
+        r.text = title
+        r.font.size = Pt(28)
+        r.font.bold = True
+
+        if subtitle:
+            sb = slide.shapes.add_textbox(Inches(0.7), Inches(0.95), Inches(12.0), Inches(0.4))
+            stf = sb.text_frame
+            stf.clear()
+            sp = stf.paragraphs[0]
+            sr = sp.add_run()
+            sr.text = subtitle
+            sr.font.size = Pt(14)
+
+    # Cover slide
+    cover = prs.slides.add_slide(prs.slide_layouts[6])
+    add_title(cover, "JIRA Executive Report", f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+
+    # KPI block
+    kpi_tb = cover.shapes.add_textbox(Inches(0.8), Inches(1.6), Inches(6.0), Inches(5.5))
+    tf = kpi_tb.text_frame
+    tf.clear()
+    tf.word_wrap = True
+    p0 = tf.paragraphs[0]
+    p0.text = "Key Metrics"
+    p0.runs[0].font.size = Pt(18)
+    p0.runs[0].font.bold = True
+
+    lines = [
+        f"Total: {kpi['total']}",
+        f"Open: {kpi['open']} ({kpi['open_pct']:.1f}%)",
+        f"Resolved: {kpi['resolved']} ({kpi['resolved_pct']:.1f}%)",
+        f"High priority (heuristic): {int(kpi['high_priority'])}",
+        f"SLA breaches (best effort): {int(kpi['sla_breaches'])}",
+        f"Median open age: {_fmt_days(kpi['median_age_open'])}",
+        f"Median cycle time: {_fmt_days(kpi['median_cycle'])}",
+        f"Backlog health score: {kpi['health_score']:.0f}/100",
+    ]
+    for ln in lines:
+        p = tf.add_paragraph()
+        p.text = ln
+        p.level = 1
+        p.font.size = Pt(14)
+
+    # Filters block
+    f_tb = cover.shapes.add_textbox(Inches(7.1), Inches(1.6), Inches(5.5), Inches(5.5))
+    ftf = f_tb.text_frame
+    ftf.clear()
+    ftf.word_wrap = True
+    fp0 = ftf.paragraphs[0]
+    fp0.text = "Applied Filters"
+    fp0.runs[0].font.size = Pt(18)
+    fp0.runs[0].font.bold = True
+
+    for k, v in filters.items():
+        if not v:
+            continue
+        p = ftf.add_paragraph()
+        p.text = f"{k}: {v}"
+        p.level = 1
+        p.font.size = Pt(12)
+
+    # Chart slides
+    for name, fig in figs.items():
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        add_title(slide, name)
+
+        png = _fig_to_png_bytes(fig)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
+            tmp.write(png)
+            tmp_path = tmp.name
+
+        slide.shapes.add_picture(tmp_path, Inches(0.7), Inches(1.3), width=Inches(12.0))
+
+    prs.save(path)
+
+
+# -----------------------------
+# Desktop App
+# -----------------------------
+class JiraEnterpriseApp:
+    def __init__(self):
+        self.root = ttk.Window(themename="cosmo")
+        self.root.title("JIRA Enterprise Analytics (Local)")
+        self.root.geometry("1100x650")
+
+        self.raw_df: Optional[pd.DataFrame] = None
+        self.df: Optional[pd.DataFrame] = None
+        self.cm: Optional[ColMap] = None
+
+        self._build_ui()
+
+    def _build_ui(self):
+        header = ttk.Frame(self.root, padding=18)
+        header.pack(fill=X)
+
+        ttk.Label(header, text="JIRA Enterprise Analytics", font=("Segoe UI", 22, "bold")).pack(anchor=W)
+        ttk.Label(header, text="Local desktop dashboard • Interactive charts + Excel/PPT exports", foreground="#5b6472").pack(anchor=W, pady=(4, 0))
+
+        # Actions row
+        actions = ttk.Frame(self.root, padding=(18, 0, 18, 10))
+        actions.pack(fill=X)
+
+        ttk.Button(actions, text="Import JIRA CSV", bootstyle=PRIMARY, command=self.import_csv).pack(side=LEFT, padx=(0, 10))
+        ttk.Button(actions, text="Open Dashboard (HTML)", bootstyle=SUCCESS, command=self.open_dashboard).pack(side=LEFT, padx=(0, 10))
+        ttk.Button(actions, text="Export Excel", bootstyle=INFO, command=self.export_excel_clicked).pack(side=LEFT, padx=(0, 10))
+        ttk.Button(actions, text="Export PowerPoint", bootstyle=WARNING, command=self.export_ppt_clicked).pack(side=LEFT)
+
+        # Main area split
+        main = ttk.Frame(self.root, padding=18)
+        main.pack(fill=BOTH, expand=True)
+
+        self.left = ttk.Frame(main)
+        self.left.pack(side=LEFT, fill=Y)
+
+        self.right = ttk.Frame(main)
+        self.right.pack(side=LEFT, fill=BOTH, expand=True, padx=(18, 0))
+
+        # Filters panel
+        filt_card = ttk.Labelframe(self.left, text="Filters", padding=12)
+        filt_card.pack(fill=Y, expand=False)
+
+        self.var_project = ttk.StringVar(value="(Any)")
+        self.var_type = ttk.StringVar(value="(Any)")
+        self.var_status = ttk.StringVar(value="(Any)")
+        self.var_priority = ttk.StringVar(value="(Any)")
+        self.var_assignee = ttk.StringVar(value="(Any)")
+        self.var_only_open = ttk.BooleanVar(value=False)
+
+        ttk.Label(filt_card, text="Project").pack(anchor=W)
+        self.cbo_project = ttk.Combobox(filt_card, textvariable=self.var_project, state="readonly", width=28, values=["(Any)"])
+        self.cbo_project.pack(anchor=W, pady=(0, 10))
+
+        ttk.Label(filt_card, text="Issue Type").pack(anchor=W)
+        self.cbo_type = ttk.Combobox(filt_card, textvariable=self.var_type, state="readonly", width=28, values=["(Any)"])
+        self.cbo_type.pack(anchor=W, pady=(0, 10))
+
+        ttk.Label(filt_card, text="Status").pack(anchor=W)
+        self.cbo_status = ttk.Combobox(filt_card, textvariable=self.var_status, state="readonly", width=28, values=["(Any)"])
+        self.cbo_status.pack(anchor=W, pady=(0, 10))
+
+        ttk.Label(filt_card, text="Priority").pack(anchor=W)
+        self.cbo_priority = ttk.Combobox(filt_card, textvariable=self.var_priority, state="readonly", width=28, values=["(Any)"])
+        self.cbo_priority.pack(anchor=W, pady=(0, 10))
+
+        ttk.Label(filt_card, text="Assignee").pack(anchor=W)
+        self.cbo_assignee = ttk.Combobox(filt_card, textvariable=self.var_assignee, state="readonly", width=28, values=["(Any)"])
+        self.cbo_assignee.pack(anchor=W, pady=(0, 10))
+
+        # Date range
+        ttk.Label(filt_card, text="Created date from (YYYY-MM-DD)").pack(anchor=W)
+        self.ent_from = ttk.Entry(filt_card, width=31)
+        self.ent_from.pack(anchor=W, pady=(0, 10))
+
+        ttk.Label(filt_card, text="Created date to (YYYY-MM-DD)").pack(anchor=W)
+        self.ent_to = ttk.Entry(filt_card, width=31)
+        self.ent_to.pack(anchor=W, pady=(0, 10))
+
+        ttk.Checkbutton(filt_card, text="Only open (unresolved)", variable=self.var_only_open, bootstyle="round-toggle").pack(anchor=W, pady=(6, 0))
+
+        ttk.Button(filt_card, text="Apply Filters", bootstyle=SECONDARY, command=self.refresh_preview).pack(anchor=W, pady=(12, 0))
+
+        # Right side KPIs + preview
+        self.kpi_row = ttk.Frame(self.right)
+        self.kpi_row.pack(fill=X)
+
+        self.kpi_cards: Dict[str, ttk.Label] = {}
+        self._make_kpi_cards()
+
+        self.preview_card = ttk.Labelframe(self.right, text="Executive Preview", padding=12)
+        self.preview_card.pack(fill=BOTH, expand=True, pady=(14, 0))
+
+        self.txt_preview = ttk.Text(self.preview_card, height=16, wrap="word")
+        self.txt_preview.pack(fill=BOTH, expand=True)
+
+        self.status = ttk.Label(self.root, text="Ready.", padding=(18, 6))
+        self.status.pack(fill=X)
+
+    def _make_kpi_cards(self):
+        # 6 cards
+        self._add_kpi("Total", "—", PRIMARY)
+        self._add_kpi("Open", "—", WARNING)
+        self._add_kpi("Resolved", "—", SUCCESS)
+        self._add_kpi("High Pri", "—", DANGER)
+        self._add_kpi("SLA", "—", INFO)
+        self._add_kpi("Health", "—", SECONDARY)
+
+    def _add_kpi(self, title: str, value: str, style):
+        card = ttk.Frame(self.kpi_row, padding=10, bootstyle=style)
+        card.pack(side=LEFT, padx=(0, 10), fill=X, expand=True)
+        ttk.Label(card, text=title, font=("Segoe UI", 10, "bold")).pack(anchor=W)
+        lab = ttk.Label(card, text=value, font=("Segoe UI", 18, "bold"))
+        lab.pack(anchor=W)
+        self.kpi_cards[title] = lab
+
+    def _set_status(self, msg: str):
+        self.status.config(text=msg)
+
+    def import_csv(self):
+        path = filedialog.askopenfilename(filetypes=[("CSV Files", "*.csv")])
+        if not path:
+            return
+
+        try:
+            raw = pd.read_csv(path, encoding_errors="ignore")
+            if raw.empty:
+                ttk.dialogs.Messagebox.show_warning("CSV contains no rows.", "Empty CSV")
+                return
+
+            self.raw_df = raw
+            self.cm = detect_columns(raw)
+            self.df = normalize(raw, self.cm)
+
+            # Populate filter dropdown values
+            self._populate_filters()
+            self._default_dates()
+            self.refresh_preview()
+
+            ttk.dialogs.Messagebox.show_info("JIRA export loaded and analysed.", "Loaded")
+            self._set_status(f"Loaded: {path}")
+        except Exception as e:
+            ttk.dialogs.Messagebox.show_error(str(e), "Import error")
+
+    def _populate_filters(self):
+        if self.df is None:
+            return
+        df = self.df
+
+        def opts(col: str) -> List[str]:
+            values = sorted([x for x in df[col].dropna().astype(str).unique().tolist() if x.strip()])
+            return ["(Any)"] + values
+
+        self.cbo_project.config(values=opts("_project"))
+        self.cbo_type.config(values=opts("_issue_type"))
+        self.cbo_status.config(values=opts("_status"))
+        self.cbo_priority.config(values=opts("_priority"))
+        self.cbo_assignee.config(values=opts("_assignee"))
+
+        self.var_project.set("(Any)")
+        self.var_type.set("(Any)")
+        self.var_status.set("(Any)")
+        self.var_priority.set("(Any)")
+        self.var_assignee.set("(Any)")
+        self.var_only_open.set(False)
+
+    def _default_dates(self):
+        if self.df is None:
+            return
+        cmin = self.df["_created"].min()
+        cmax = self.df["_created"].max()
+        if pd.isna(cmin):
+            cmin = pd.Timestamp(date.today().replace(year=date.today().year - 1))
+        if pd.isna(cmax):
+            cmax = pd.Timestamp(date.today())
+
+        self.ent_from.delete(0, "end")
+        self.ent_to.delete(0, "end")
+        self.ent_from.insert(0, cmin.strftime("%Y-%m-%d"))
+        self.ent_to.insert(0, cmax.strftime("%Y-%m-%d"))
+
+    def _parse_date(self, s: str) -> Optional[pd.Timestamp]:
+        s = (s or "").strip()
+        if not s:
+            return None
+        try:
+            return pd.Timestamp(datetime.strptime(s, "%Y-%m-%d").date())
+        except Exception:
+            return None
+
+    def _apply_filters(self) -> Tuple[pd.DataFrame, Dict[str, str]]:
+        assert self.df is not None
+        df = self.df
+
+        mask = pd.Series([True] * len(df))
+
+        # Date range on created
+        d_from = self._parse_date(self.ent_from.get())
+        d_to = self._parse_date(self.ent_to.get())
+        if d_from is not None and d_to is not None:
+            mask &= df["_created"].between(d_from, d_to + pd.Timedelta(days=1), inclusive="left")
+
+        def apply_eq(var: ttk.StringVar, col: str):
+            nonlocal mask
+            v = var.get()
+            if v and v != "(Any)":
+                mask &= df[col].astype(str) == v
+
+        apply_eq(self.var_project, "_project")
+        apply_eq(self.var_type, "_issue_type")
+        apply_eq(self.var_status, "_status")
+        apply_eq(self.var_priority, "_priority")
+        apply_eq(self.var_assignee, "_assignee")
+
+        if self.var_only_open.get():
+            mask &= df["_is_open"]
+
+        filtered = df[mask].copy()
+
+        filters = {
+            "Project": self.var_project.get() if self.var_project.get() != "(Any)" else "",
+            "Issue Type": self.var_type.get() if self.var_type.get() != "(Any)" else "",
+            "Status": self.var_status.get() if self.var_status.get() != "(Any)" else "",
+            "Priority": self.var_priority.get() if self.var_priority.get() != "(Any)" else "",
+            "Assignee": self.var_assignee.get() if self.var_assignee.get() != "(Any)" else "",
+            "Only open": "Yes" if self.var_only_open.get() else "",
+            "Created from": self.ent_from.get().strip(),
+            "Created to": self.ent_to.get().strip(),
+        }
+        return filtered, filters
+
+    def refresh_preview(self):
+        if self.df is None:
+            return
+
+        filtered, filters = self._apply_filters()
+        kpi = compute_kpis(filtered)
+        tables = exec_tables(filtered)
+
+        # Update KPI cards
+        self.kpi_cards["Total"].config(text=str(kpi["total"]))
+        self.kpi_cards["Open"].config(text=f"{kpi['open']} ({kpi['open_pct']:.1f}%)")
+        self.kpi_cards["Resolved"].config(text=f"{kpi['resolved']} ({kpi['resolved_pct']:.1f}%)")
+        self.kpi_cards["High Pri"].config(text=str(int(kpi["high_priority"])))
+        self.kpi_cards["SLA"].config(text=str(int(kpi["sla_breaches"])))
+        self.kpi_cards["Health"].config(text=f"{kpi['health_score']:.0f}/100")
+
+        # Preview text
+        oldest = tables["Oldest Open (Top 25)"].head(5)
+        highpri = tables["High Priority Open (Top 25)"].head(5)
+
+        def fmt_rows(tdf: pd.DataFrame) -> str:
+            if tdf is None or tdf.empty:
+                return "  (none)\n"
+            lines = []
+            for _, r in tdf.iterrows():
+                key = r.get("_key", "")
+                summ = _clean_str(r.get("_summary", ""))[:80]
+                age = r.get("_age_days", "")
+                pr = r.get("_priority", "")
+                st = r.get("_status", "")
+                ass = r.get("_assignee", "")
+                lines.append(f"  - {key} | {summ} | {age}d | {pr} | {st} | {ass}")
+            return "\n".join(lines) + "\n"
+
+        self.txt_preview.delete("1.0", "end")
+        self.txt_preview.insert("end", "Executive Summary Preview\n")
+        self.txt_preview.insert("end", "-------------------------\n")
+        self.txt_preview.insert("end", f"Total: {kpi['total']} | Open: {kpi['open']} | Resolved: {kpi['resolved']}\n")
+        self.txt_preview.insert("end", f"Median open age: {_fmt_days(kpi['median_age_open'])} | Median cycle: {_fmt_days(kpi['median_cycle'])}\n")
+        self.txt_preview.insert("end", f"High priority (heuristic): {int(kpi['high_priority'])} | SLA breaches: {int(kpi['sla_breaches'])}\n")
+        self.txt_preview.insert("end", f"Backlog health score: {kpi['health_score']:.0f}/100\n\n")
+        self.txt_preview.insert("end", "Top oldest open tickets:\n")
+        self.txt_preview.insert("end", fmt_rows(oldest))
+        self.txt_preview.insert("end", "\nTop high priority open tickets:\n")
+        self.txt_preview.insert("end", fmt_rows(highpri))
+
+        self._set_status(f"Preview refreshed • {len(filtered)} tickets after filters.")
+
+    def _prepare_bundle(self) -> Tuple[pd.DataFrame, Dict[str, float], Dict[str, go.Figure], Dict[str, pd.DataFrame], Dict[str, str]]:
+        if self.df is None:
+            raise RuntimeError("No data loaded.")
+        filtered, filters = self._apply_filters()
+        kpi = compute_kpis(filtered)
+        figs = build_figures(filtered)
+        tables = exec_tables(filtered)
+        return filtered, kpi, figs, tables, filters
+
+    def open_dashboard(self):
+        if self.df is None:
+            ttk.dialogs.Messagebox.show_warning("Import a CSV first.", "No data")
+            return
+        try:
+            _, kpi, figs, tables, filters = self._prepare_bundle()
+            html = build_html_dashboard(kpi=kpi, figs=figs, tables=tables, filters=filters)
+
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".html")
+            with open(tmp.name, "w", encoding="utf-8") as f:
+                f.write(html)
+
+            webbrowser.open(tmp.name)
+            self._set_status("Opened local HTML dashboard.")
+        except Exception as e:
+            ttk.dialogs.Messagebox.show_error(str(e), "Dashboard error")
+
+    def export_excel_clicked(self):
+        if self.df is None:
+            ttk.dialogs.Messagebox.show_warning("Import a CSV first.", "No data")
+            return
+        path = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel", "*.xlsx")])
+        if not path:
+            return
+        try:
+            _, kpi, _, tables, filters = self._prepare_bundle()
+            export_excel(path, kpi=kpi, filters=filters, tables=tables)
+            ttk.dialogs.Messagebox.show_info("Excel report exported successfully.", "Export complete")
+            self._set_status(f"Excel exported: {path}")
+        except Exception as e:
+            ttk.dialogs.Messagebox.show_error(str(e), "Excel export error")
+
+    def export_ppt_clicked(self):
+        if self.df is None:
+            ttk.dialogs.Messagebox.show_warning("Import a CSV first.", "No data")
+            return
+        path = filedialog.asksaveasfilename(defaultextension=".pptx", filetypes=[("PowerPoint", "*.pptx")])
+        if not path:
+            return
+        try:
+            _, kpi, figs, _, filters = self._prepare_bundle()
+            export_pptx(path, kpi=kpi, filters=filters, figs=figs)
+            ttk.dialogs.Messagebox.show_info("PowerPoint exec pack exported successfully.", "Export complete")
+            self._set_status(f"PPT exported: {path}")
+        except Exception as e:
+            ttk.dialogs.Messagebox.show_error(
+                f"{e}\n\nTip: Ensure 'kaleido' is installed for chart image export:\n  pip install kaleido",
+                "PowerPoint export error"
+            )
+
+    def run(self):
+        self.root.mainloop()
+
+
+if __name__ == "__main__":
+    JiraEnterpriseApp().run()
