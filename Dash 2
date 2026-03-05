@@ -1,0 +1,218 @@
+import ttkbootstrap as ttk
+from ttkbootstrap.constants import *
+from tkinter import filedialog
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from openpyxl import Workbook
+
+class JiraDashboard:
+
+    def __init__(self, root):
+
+        self.root = root
+        self.root.title("JIRA Analytics Dashboard")
+        self.root.geometry("1200x800")
+
+        self.df = None
+
+        title = ttk.Label(
+            root,
+            text="JIRA Analytics Dashboard",
+            font=("Segoe UI", 22, "bold")
+        )
+        title.pack(pady=15)
+
+        button_frame = ttk.Frame(root)
+        button_frame.pack(pady=10)
+
+        ttk.Button(
+            button_frame,
+            text="Import JIRA CSV",
+            bootstyle=PRIMARY,
+            command=self.load_csv
+        ).grid(row=0, column=0, padx=10)
+
+        ttk.Button(
+            button_frame,
+            text="Generate Dashboard",
+            bootstyle=SUCCESS,
+            command=self.generate_dashboard
+        ).grid(row=0, column=1, padx=10)
+
+        ttk.Button(
+            button_frame,
+            text="Export Excel Report",
+            bootstyle=INFO,
+            command=self.export_excel
+        ).grid(row=0, column=2, padx=10)
+
+        self.kpi_frame = ttk.Frame(root)
+        self.kpi_frame.pack(pady=20)
+
+        self.chart_frame = ttk.Frame(root)
+        self.chart_frame.pack(fill=BOTH, expand=True)
+
+    def load_csv(self):
+
+        path = filedialog.askopenfilename(filetypes=[("CSV Files","*.csv")])
+
+        if not path:
+            return
+
+        self.df = pd.read_csv(path)
+
+        ttk.dialogs.Messagebox.show_info(
+            "JIRA file loaded successfully",
+            "Success"
+        )
+
+    def clear_charts(self):
+
+        for widget in self.chart_frame.winfo_children():
+            widget.destroy()
+
+    def show_kpis(self):
+
+        for widget in self.kpi_frame.winfo_children():
+            widget.destroy()
+
+        total = len(self.df)
+
+        if "Status" in self.df.columns:
+            open_tickets = len(self.df[self.df["Status"] != "Done"])
+            closed_tickets = len(self.df[self.df["Status"] == "Done"])
+        else:
+            open_tickets = 0
+            closed_tickets = 0
+
+        if "Priority" in self.df.columns:
+            high_priority = len(self.df[self.df["Priority"].str.contains("High", na=False)])
+        else:
+            high_priority = 0
+
+        kpis = [
+            ("Total Tickets", total),
+            ("Open Tickets", open_tickets),
+            ("Closed Tickets", closed_tickets),
+            ("High Priority", high_priority)
+        ]
+
+        for i, (title, value) in enumerate(kpis):
+
+            card = ttk.Frame(self.kpi_frame, padding=15, bootstyle=SECONDARY)
+            card.grid(row=0, column=i, padx=15)
+
+            ttk.Label(card, text=title, font=("Segoe UI",12)).pack()
+            ttk.Label(card, text=value, font=("Segoe UI",18,"bold")).pack()
+
+    def generate_dashboard(self):
+
+        if self.df is None:
+            ttk.dialogs.Messagebox.show_warning(
+                "Please import a JIRA CSV first",
+                "No Data"
+            )
+            return
+
+        self.clear_charts()
+
+        self.show_kpis()
+
+        fig, axs = plt.subplots(2,2, figsize=(10,7))
+
+        if "Status" in self.df.columns:
+            self.df["Status"].value_counts().plot(
+                kind="pie",
+                ax=axs[0,0],
+                title="Tickets by Status"
+            )
+
+        if "Priority" in self.df.columns:
+            self.df["Priority"].value_counts().plot(
+                kind="bar",
+                ax=axs[0,1],
+                title="Tickets by Priority"
+            )
+
+        if "Assignee" in self.df.columns:
+            self.df["Assignee"].value_counts().head(10).plot(
+                kind="bar",
+                ax=axs[1,0],
+                title="Top Assignees"
+            )
+
+        if "Created" in self.df.columns:
+
+            self.df["Created"] = pd.to_datetime(self.df["Created"], errors="coerce")
+
+            self.df["Month"] = self.df["Created"].dt.to_period("M")
+
+            trend = self.df.groupby("Month").size()
+
+            trend.plot(
+                kind="line",
+                ax=axs[1,1],
+                title="Tickets Created Over Time"
+            )
+
+        plt.tight_layout()
+
+        canvas = FigureCanvasTkAgg(fig, master=self.chart_frame)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=BOTH, expand=True)
+
+    def export_excel(self):
+
+        if self.df is None:
+            return
+
+        path = filedialog.asksaveasfilename(defaultextension=".xlsx")
+
+        if not path:
+            return
+
+        wb = Workbook()
+
+        ws = wb.active
+        ws.title = "Summary"
+
+        ws.append(["Metric","Value"])
+
+        total = len(self.df)
+
+        if "Status" in self.df.columns:
+            open_tickets = len(self.df[self.df["Status"] != "Done"])
+            closed_tickets = len(self.df[self.df["Status"] == "Done"])
+        else:
+            open_tickets = 0
+            closed_tickets = 0
+
+        ws.append(["Total Tickets", total])
+        ws.append(["Open Tickets", open_tickets])
+        ws.append(["Closed Tickets", closed_tickets])
+
+        if "Assignee" in self.df.columns:
+
+            ws2 = wb.create_sheet("Tickets by Assignee")
+
+            ws2.append(["Assignee","Tickets"])
+
+            counts = self.df["Assignee"].value_counts()
+
+            for name,count in counts.items():
+                ws2.append([name,count])
+
+        wb.save(path)
+
+        ttk.dialogs.Messagebox.show_info(
+            "Report exported successfully",
+            "Export Complete"
+        )
+
+
+root = ttk.Window(themename="flatly")
+
+app = JiraDashboard(root)
+
+root.mainloop()
