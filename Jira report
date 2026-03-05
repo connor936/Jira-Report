@@ -1,0 +1,101 @@
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+from datetime import datetime
+
+st.set_page_config(page_title="JIRA Dashboard", layout="wide")
+
+st.title("📊 JIRA Reporting Dashboard")
+
+uploaded_file = st.file_uploader("Upload JIRA CSV Export", type=["csv"])
+
+if uploaded_file:
+
+    df = pd.read_csv(uploaded_file)
+
+    st.subheader("Raw Data")
+    st.dataframe(df)
+
+    # Convert date fields if present
+    date_cols = ["Created", "Resolved", "Updated"]
+
+    for col in date_cols:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.metric("Total Tickets", len(df))
+
+    if "Status" in df.columns:
+        open_tickets = df[df["Status"] != "Done"].shape[0]
+        closed_tickets = df[df["Status"] == "Done"].shape[0]
+
+        with col2:
+            st.metric("Open Tickets", open_tickets)
+
+        with col3:
+            st.metric("Closed Tickets", closed_tickets)
+
+    st.divider()
+
+    # Status Chart
+    if "Status" in df.columns:
+        status_counts = df["Status"].value_counts()
+        fig = px.pie(
+            values=status_counts.values,
+            names=status_counts.index,
+            title="Tickets by Status"
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Priority Chart
+    if "Priority" in df.columns:
+        priority_counts = df["Priority"].value_counts()
+        fig = px.bar(
+            x=priority_counts.index,
+            y=priority_counts.values,
+            title="Tickets by Priority"
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Assignee Chart
+    if "Assignee" in df.columns:
+        assignee_counts = df["Assignee"].value_counts().head(10)
+        fig = px.bar(
+            x=assignee_counts.index,
+            y=assignee_counts.values,
+            title="Top Assignees"
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Trend Chart
+    if "Created" in df.columns:
+        df["Month"] = df["Created"].dt.to_period("M").astype(str)
+        trend = df.groupby("Month").size()
+
+        fig = px.line(
+            x=trend.index,
+            y=trend.values,
+            title="Tickets Created Over Time"
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Resolution Time
+    if "Created" in df.columns and "Resolved" in df.columns:
+        df["Resolution Days"] = (df["Resolved"] - df["Created"]).dt.days
+
+        avg_res = df["Resolution Days"].mean()
+
+        st.metric("Average Resolution Time (Days)", round(avg_res, 2))
+
+        fig = px.histogram(
+            df,
+            x="Resolution Days",
+            title="Resolution Time Distribution"
+        )
+
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.success("Dashboard generated successfully!")
