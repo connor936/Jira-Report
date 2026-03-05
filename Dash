@@ -1,0 +1,813 @@
+import io
+import re
+import math
+import tempfile
+from dataclasses import dataclass
+from datetime import datetime, date, timedelta
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+
+# Optional (PPT export). If missing, PPT export will be disabled gracefully.
+try:
+    from pptx import Presentation
+    from pptx.util import Inches, Pt
+    from pptx.dml.color import RGBColor
+    PPTX_AVAILABLE = True
+except Exception:
+    PPTX_AVAILABLE = False
+
+# Optional (plotly image export for PPT). If missing, PPT export will be disabled gracefully.
+try:
+    import kaleido  # noqa: F401
+    KALEIDO_AVAILABLE = True
+except Exception:
+    KALEIDO_AVAILABLE = False
+
+
+# -----------------------------
+# App Config
+# -----------------------------
+st.set_page_config(page_title="JIRA Executive Dashboard", layout="wide")
+
+APP_TITLE = "📈 JIRA Executive Intelligence Dashboard"
+APP_SUBTITLE = "Upload a JIRA CSV export to generate an exec-ready dashboard + exports."
+
+
+# -----------------------------
+# Utilities
+# -----------------------------
+def _clean_str(x) -> str:
+    if pd.isna(x):
+        return ""
+    return str(x).strip()
+
+
+def _to_datetime(series: pd.Series) -> pd.Series:
+    # Jira exports can be ISO-ish, locale-ish, or include timezones.
+    # We'll let pandas parse with errors='coerce'.
+    return pd.to_datetime(series, errors="coerce", utc=False)
+
+
+def _split_multivalue(series: pd.Series, sep_regex=r"[;,]") -> pd.Series:
+    # Normalize multi-value columns (labels, components, etc.)
+    def norm(v):
+        s = _clean_str(v)
+        if not s:
+            return []
+        parts = [p.strip() for p in re.split(sep_regex, s) if p.strip()]
+        return parts
+
+    return series.apply(norm)
+
+
+def _safe_value_counts(series: pd.Series, top_n: int = 20) -> pd.DataFrame:
+    s = series.dropna().astype(str).replace({"": np.nan}).dropna()
+    if s.empty:
+        return pd.DataFrame(columns=["Value", "Count"])
+    vc = s.value_counts().head(top_n)
+    return pd.DataFrame({"Value": vc.index, "Count": vc.values})
+
+
+def _format_days(x: Optional[float]) -> str:
+    if x is None or (isinstance(x, float) and math.isnan(x)):
+        return "—"
+    if x < 1:
+        hours = int(round(x * 24))
+        return f"{hours}h"
+    return f"{x:.1f}d"
+
+
+def _median_or_nan(series: pd.Series) -> float:
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    return float(s.median()) if not s.empty else float("nan")
+
+
+def _mean_or_nan(series: pd.Series) -> float:
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    return float(s.mean()) if not s.empty else float("nan")
+
+
+def _pct(part: float, whole: float) -> float:
+    if whole == 0:
+        return 0.0
+    return (part / whole) * 100.0
+
+
+def _today_local() -> pd.Timestamp:
+    # Keep it simple: treat "today" as local date (no tz)
+    return pd.Timestamp(datetime.now().date())
+
+
+def _month_period(dt: pd.Series) -> pd.Series:
+    return dt.dt.to_period("M").astype(str)
+
+
+@dataclass
+class ColMap:
+    key: Optional[str] = None
+    summary: Optional[str] = None
+    status: Optional[str] = None
+    priority: Optional[str] = None
+    assignee: Optional[str] = None
+    reporter: Optional[str] = None
+    issue_type: Optional[str] = None
+    project: Optional[str] = None
+    created: Optional[str] = None
+    updated: Optional[str] = None
+    resolved: Optional[str] = None
+    due: Optional[str] = None
+    labels: Optional[str] = None
+    components: Optional[str] = None
+    epic_link: Optional[str] = None
+    parent: Optional[str] = None
+    sprint: Optional[str] = None
+    story_points: Optional[str] = None
+    time_original_estimate: Optional[str] = None
+    time_remaining: Optional[str] = None
+    time_spent: Optional[str] = None
+    sla_target: Optional[str] = None
+    sla_elapsed: Optional[str] = None
+    sla_breached: Optional[str] = None
+    resolution: Optional[str] = None
+
+
+def detect_columns(df: pd.DataFrame) -> ColMap:
+    """
+    Heuristic mapping for common Jira CSV export headers.
+    Handles variations like:
+    - "Issue key", "Key"
+    - "Summary"
+    - "Status"
+    - "Priority"
+    - "Assignee", "Assignee Name"
+    - "Created", "Resolved", "Updated"
+    - "Issue Type"
+    - "Project name", "Project"
+    - "Labels", "Component/s"
+    - Story points: "Story Points", "Σ Story Points"
+    - SLA fields: varies a lot; best effort
+    """
+    cols = {c: re.sub(r"\s+", " ", c.strip().lower()) for c in df.columns}
+
+    def pick(*candidates: str) -> Optional[str]:
+        for cand in candidates:
+            cand_l = cand.lower()
+            for orig, norm in cols.items():
+                if norm == cand_l:
+                    return orig
+            # fallback contains match
+            for orig, norm in cols.items():
+                if cand_l in norm:
+                    return orig
+        return None
+
+    cm = ColMap(
+        key=pick("issue key", "key"),
+        summary=pick("summary"),
+        status=pick("status"),
+        priority=pick("priority"),
+        assignee=pick("assignee", "assignee name"),
+        reporter=pick("reporter", "reporter name"),
+        issue_type=pick("issue type", "type"),
+        project=pick("project name", "project", "project key"),
+        created=pick("created", "created date"),
+        updated=pick("updated", "updated date"),
+        resolved=pick("resolved", "resolution date", "resolved date"),
+        due=pick("due date", "due"),
+        labels=pick("labels", "label"),
+        components=pick("component/s", "components", "component"),
+        epic_link=pick("epic link", "epic", "epic name"),
+        parent=pick("parent"),
+        sprint=pick("sprint", "sprint name"),
+        story_points=pick("story points", "Σ story points", "∑ story points", "custom field (story points)"),
+        time_original_estimate=pick("original estimate", "time original estimate"),
+        time_remaining=pick("remaining estimate", "time remaining"),
+        time_spent=pick("time spent", "timespent"),
+        resolution=pick("resolution"),
+    )
+
+    # SLA - best effort; people export plugins with columns like "Time to resolution (SLA)"
+    cm.sla_breached = pick("sla breached", "breached", "time to resolution (sla) breached")
+    cm.sla_target = pick("sla target", "goal", "time to resolution (sla) goal")
+    cm.sla_elapsed = pick("sla elapsed", "elapsed", "time to resolution (sla) elapsed")
+    return cm
+
+
+def normalize_dataframe(df: pd.DataFrame, cm: ColMap) -> pd.DataFrame:
+    out = df.copy()
+
+    # Standardize key columns presence
+    def col_or_blank(colname: Optional[str]) -> pd.Series:
+        if colname and colname in out.columns:
+            return out[colname]
+        return pd.Series([""] * len(out))
+
+    out["_key"] = col_or_blank(cm.key).astype(str)
+    out["_summary"] = col_or_blank(cm.summary).astype(str)
+    out["_status"] = col_or_blank(cm.status).astype(str)
+    out["_priority"] = col_or_blank(cm.priority).astype(str)
+    out["_assignee"] = col_or_blank(cm.assignee).astype(str)
+    out["_reporter"] = col_or_blank(cm.reporter).astype(str)
+    out["_issue_type"] = col_or_blank(cm.issue_type).astype(str)
+    out["_project"] = col_or_blank(cm.project).astype(str)
+    out["_resolution"] = col_or_blank(cm.resolution).astype(str)
+
+    out["_created"] = _to_datetime(col_or_blank(cm.created))
+    out["_updated"] = _to_datetime(col_or_blank(cm.updated))
+    out["_resolved"] = _to_datetime(col_or_blank(cm.resolved))
+    out["_due"] = _to_datetime(col_or_blank(cm.due))
+
+    # Multi-value fields
+    out["_labels"] = _split_multivalue(col_or_blank(cm.labels))
+    out["_components"] = _split_multivalue(col_or_blank(cm.components))
+
+    # Numeric fields (best effort)
+    sp = pd.to_numeric(col_or_blank(cm.story_points), errors="coerce")
+    out["_story_points"] = sp
+
+    # Time fields may be seconds in Jira exports
+    def to_hours(series):
+        s = pd.to_numeric(series, errors="coerce")
+        # If values look like seconds (large), convert to hours
+        # This is a heuristic; if it's already hours, this won't be perfect but still usable.
+        if s.dropna().median() if not s.dropna().empty else 0 > 1000:
+            return s / 3600.0
+        return s
+
+    out["_orig_est_h"] = to_hours(col_or_blank(cm.time_original_estimate))
+    out["_remaining_h"] = to_hours(col_or_blank(cm.time_remaining))
+    out["_spent_h"] = to_hours(col_or_blank(cm.time_spent))
+
+    # SLA fields (if any)
+    out["_sla_breached"] = col_or_blank(cm.sla_breached).astype(str)
+    out["_sla_target"] = col_or_blank(cm.sla_target).astype(str)
+    out["_sla_elapsed"] = col_or_blank(cm.sla_elapsed).astype(str)
+
+    # Derived metrics
+    today = _today_local()
+    out["_is_resolved"] = out["_resolved"].notna()
+    out["_age_days"] = (today - out["_created"]).dt.days
+    out["_age_days"] = out["_age_days"].where(out["_created"].notna(), np.nan)
+
+    out["_cycle_days"] = (out["_resolved"] - out["_created"]).dt.total_seconds() / 86400.0
+    out["_cycle_days"] = out["_cycle_days"].where(out["_is_resolved"], np.nan)
+
+    # "Open" definition: not resolved. Some workflows use Done/Closed; resolved date is more robust.
+    out["_is_open"] = ~out["_is_resolved"]
+
+    # Create a tidy "month" for trends
+    out["_created_month"] = _month_period(out["_created"])
+    out["_resolved_month"] = _month_period(out["_resolved"])
+
+    # Clean blanks to NaN for nicer charts
+    for c in ["_status", "_priority", "_assignee", "_reporter", "_issue_type", "_project", "_resolution"]:
+        out[c] = out[c].replace({"": np.nan})
+
+    return out
+
+
+def apply_filters(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, List[str]]]:
+    """
+    Sidebar filters. Returns filtered df and the options dict (useful for exports).
+    """
+    st.sidebar.header("Filters")
+
+    # Date range based on Created
+    created_min = df["_created"].min()
+    created_max = df["_created"].max()
+    if pd.isna(created_min) or pd.isna(created_max):
+        created_min = pd.Timestamp("2000-01-01")
+        created_max = pd.Timestamp(datetime.now())
+
+    date_from, date_to = st.sidebar.date_input(
+        "Created date range",
+        value=(created_min.date(), created_max.date()),
+        min_value=date(2000, 1, 1),
+        max_value=date(2100, 1, 1),
+    )
+    mask = pd.Series([True] * len(df))
+    mask &= df["_created"].between(pd.Timestamp(date_from), pd.Timestamp(date_to) + pd.Timedelta(days=1), inclusive="left")
+
+    def multiselect_filter(label, col):
+        options = sorted([x for x in df[col].dropna().astype(str).unique().tolist()])
+        selected = st.sidebar.multiselect(label, options, default=[])
+        if selected:
+            nonlocal mask
+            mask &= df[col].astype(str).isin(selected)
+        return selected
+
+    selected_project = multiselect_filter("Project", "_project")
+    selected_type = multiselect_filter("Issue Type", "_issue_type")
+    selected_status = multiselect_filter("Status", "_status")
+    selected_priority = multiselect_filter("Priority", "_priority")
+    selected_assignee = multiselect_filter("Assignee", "_assignee")
+
+    only_open = st.sidebar.checkbox("Only open (unresolved)", value=False)
+    if only_open:
+        mask &= df["_is_open"]
+
+    # Label filter (contains-any)
+    all_labels = sorted({lbl for labels in df["_labels"] for lbl in labels})
+    selected_labels = st.sidebar.multiselect("Labels (contains any)", all_labels, default=[])
+    if selected_labels:
+        mask &= df["_labels"].apply(lambda lst: any(x in lst for x in selected_labels))
+
+    # Component filter
+    all_comps = sorted({c for comps in df["_components"] for c in comps})
+    selected_comps = st.sidebar.multiselect("Components (contains any)", all_comps, default=[])
+    if selected_comps:
+        mask &= df["_components"].apply(lambda lst: any(x in lst for x in selected_comps))
+
+    filtered = df[mask].copy()
+
+    selections = {
+        "date_from": [str(date_from)],
+        "date_to": [str(date_to)],
+        "project": selected_project,
+        "issue_type": selected_type,
+        "status": selected_status,
+        "priority": selected_priority,
+        "assignee": selected_assignee,
+        "labels": selected_labels,
+        "components": selected_comps,
+        "only_open": [str(only_open)],
+    }
+    return filtered, selections
+
+
+def kpis(df: pd.DataFrame) -> Dict[str, float]:
+    total = len(df)
+    open_cnt = int(df["_is_open"].sum())
+    resolved_cnt = int(df["_is_resolved"].sum())
+
+    median_age_open = _median_or_nan(df.loc[df["_is_open"], "_age_days"])
+    median_cycle = _median_or_nan(df["_cycle_days"])
+    mean_cycle = _mean_or_nan(df["_cycle_days"])
+
+    return {
+        "total": total,
+        "open": open_cnt,
+        "resolved": resolved_cnt,
+        "open_pct": _pct(open_cnt, total),
+        "resolved_pct": _pct(resolved_cnt, total),
+        "median_age_open": median_age_open,
+        "median_cycle": median_cycle,
+        "mean_cycle": mean_cycle,
+    }
+
+
+def chart_status(df: pd.DataFrame) -> go.Figure:
+    vc = df["_status"].fillna("Unknown").value_counts().reset_index()
+    vc.columns = ["Status", "Count"]
+    fig = px.pie(vc, names="Status", values="Count", title="Tickets by Status")
+    fig.update_layout(margin=dict(l=10, r=10, t=60, b=10))
+    return fig
+
+
+def chart_priority(df: pd.DataFrame) -> go.Figure:
+    vc = df["_priority"].fillna("Unknown").value_counts().reset_index()
+    vc.columns = ["Priority", "Count"]
+    fig = px.bar(vc, x="Priority", y="Count", title="Tickets by Priority")
+    fig.update_layout(margin=dict(l=10, r=10, t=60, b=10))
+    return fig
+
+
+def chart_assignee_workload(df: pd.DataFrame) -> go.Figure:
+    vc = df.loc[df["_is_open"], "_assignee"].fillna("Unassigned").value_counts().head(15).reset_index()
+    vc.columns = ["Assignee", "Open Tickets"]
+    fig = px.bar(vc, x="Assignee", y="Open Tickets", title="Open Workload by Assignee (Top 15)")
+    fig.update_layout(margin=dict(l=10, r=10, t=60, b=10), xaxis_tickangle=-30)
+    return fig
+
+
+def chart_created_vs_resolved(df: pd.DataFrame) -> go.Figure:
+    created = df["_created_month"].value_counts().sort_index()
+    resolved = df["_resolved_month"].value_counts().sort_index()
+
+    # Combine index
+    idx = sorted(set(created.index.tolist()) | set(resolved.index.tolist()))
+    c = [int(created.get(i, 0)) for i in idx]
+    r = [int(resolved.get(i, 0)) for i in idx]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=idx, y=c, mode="lines+markers", name="Created"))
+    fig.add_trace(go.Scatter(x=idx, y=r, mode="lines+markers", name="Resolved"))
+    fig.update_layout(
+        title="Created vs Resolved (Monthly)",
+        xaxis_title="Month",
+        yaxis_title="Count",
+        margin=dict(l=10, r=10, t=60, b=10),
+    )
+    return fig
+
+
+def chart_throughput(df: pd.DataFrame) -> go.Figure:
+    # Weekly resolved throughput (last ~16 weeks if data allows)
+    s = df.loc[df["_is_resolved"] & df["_resolved"].notna(), "_resolved"].copy()
+    if s.empty:
+        fig = go.Figure()
+        fig.update_layout(title="Resolved Throughput (Weekly) — No resolved dates found")
+        return fig
+
+    wk = s.dt.to_period("W").astype(str).value_counts().sort_index()
+    wk = wk.tail(16)
+    fig = px.bar(x=wk.index, y=wk.values, title="Resolved Throughput (Weekly, last 16 data points)")
+    fig.update_layout(margin=dict(l=10, r=10, t=60, b=10), xaxis_tickangle=-30)
+    fig.update_xaxes(title="Week")
+    fig.update_yaxes(title="Resolved count")
+    return fig
+
+
+def chart_aging_buckets(df: pd.DataFrame) -> go.Figure:
+    open_df = df[df["_is_open"] & df["_age_days"].notna()].copy()
+    if open_df.empty:
+        fig = go.Figure()
+        fig.update_layout(title="Open Ticket Aging Buckets — No open tickets with created dates")
+        return fig
+
+    bins = [-1, 7, 14, 30, 60, 90, 180, 10_000]
+    labels = ["0-7d", "8-14d", "15-30d", "31-60d", "61-90d", "91-180d", "180d+"]
+    open_df["Bucket"] = pd.cut(open_df["_age_days"], bins=bins, labels=labels)
+    vc = open_df["Bucket"].value_counts().reindex(labels, fill_value=0).reset_index()
+    vc.columns = ["Bucket", "Count"]
+    fig = px.bar(vc, x="Bucket", y="Count", title="Open Ticket Aging Buckets")
+    fig.update_layout(margin=dict(l=10, r=10, t=60, b=10))
+    return fig
+
+
+def make_exec_tables(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+    """
+    Returns a dict of named tables for display/export.
+    """
+    cols = ["_key", "_summary", "_project", "_issue_type", "_priority", "_status", "_assignee", "_created", "_age_days"]
+
+    open_df = df[df["_is_open"]].copy()
+    high_pri = open_df[open_df["_priority"].astype(str).str.contains("highest|high|p1|p2|critical", case=False, na=False)].copy()
+
+    oldest_open = open_df.sort_values("_age_days", ascending=False).head(25)[cols]
+    high_priority_open = high_pri.sort_values("_age_days", ascending=False).head(25)[cols]
+
+    # Unassigned open
+    unassigned = open_df[open_df["_assignee"].isna()].sort_values("_age_days", ascending=False).head(25)[cols]
+
+    # SLA breaches (best effort)
+    sla_breaches = pd.DataFrame()
+    if "_sla_breached" in df.columns:
+        bre = df[df["_sla_breached"].astype(str).str.contains("true|breach|yes", case=False, na=False)].copy()
+        if not bre.empty:
+            sla_breaches = bre[cols + ["_sla_breached", "_sla_target", "_sla_elapsed"]].head(50)
+
+    return {
+        "Oldest Open (Top 25)": oldest_open,
+        "High Priority Open (Top 25)": high_priority_open,
+        "Unassigned Open (Top 25)": unassigned,
+        "SLA Breaches (Best Effort)": sla_breaches,
+    }
+
+
+def to_excel_bytes(tables: Dict[str, pd.DataFrame], meta: Dict[str, List[str]], kpi: Dict[str, float]) -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        # Meta
+        meta_df = pd.DataFrame([(k, ", ".join(v)) for k, v in meta.items()], columns=["Filter", "Selection"])
+        meta_df.to_excel(writer, index=False, sheet_name="Filters")
+
+        # KPI
+        kpi_df = pd.DataFrame(
+            [
+                ("Total tickets", kpi["total"]),
+                ("Open tickets", kpi["open"]),
+                ("Resolved tickets", kpi["resolved"]),
+                ("Median age (open, days)", kpi["median_age_open"]),
+                ("Median cycle time (days)", kpi["median_cycle"]),
+                ("Mean cycle time (days)", kpi["mean_cycle"]),
+            ],
+            columns=["Metric", "Value"],
+        )
+        kpi_df.to_excel(writer, index=False, sheet_name="KPIs")
+
+        # Tables
+        for name, tdf in tables.items():
+            safe_name = re.sub(r"[\[\]\*\/\\\?\:]", "-", name)[:31]
+            if tdf is None or tdf.empty:
+                pd.DataFrame({"Info": [f"No rows for: {name}"]}).to_excel(writer, index=False, sheet_name=safe_name)
+            else:
+                # prettify columns
+                out = tdf.copy()
+                out.columns = [c.lstrip("_").replace("_", " ").title() for c in out.columns]
+                out.to_excel(writer, index=False, sheet_name=safe_name)
+    return output.getvalue()
+
+
+def _plotly_to_png_bytes(fig: go.Figure, width: int = 1200, height: int = 700) -> Optional[bytes]:
+    if not KALEIDO_AVAILABLE:
+        return None
+    try:
+        return fig.to_image(format="png", width=width, height=height, scale=2)
+    except Exception:
+        return None
+
+
+def to_pptx_bytes(
+    meta: Dict[str, List[str]],
+    kpi: Dict[str, float],
+    figs: Dict[str, go.Figure],
+    tables: Dict[str, pd.DataFrame],
+) -> Optional[bytes]:
+    if not (PPTX_AVAILABLE and KALEIDO_AVAILABLE):
+        return None
+
+    prs = Presentation()
+    prs.slide_width = Inches(13.33)
+    prs.slide_height = Inches(7.5)
+
+    def add_title(slide, title: str, subtitle: Optional[str] = None):
+        title_box = slide.shapes.add_textbox(Inches(0.6), Inches(0.3), Inches(12.2), Inches(0.6))
+        tf = title_box.text_frame
+        tf.clear()
+        p = tf.paragraphs[0]
+        run = p.add_run()
+        run.text = title
+        run.font.size = Pt(28)
+        run.font.bold = True
+
+        if subtitle:
+            sub_box = slide.shapes.add_textbox(Inches(0.6), Inches(0.95), Inches(12.2), Inches(0.4))
+            tf2 = sub_box.text_frame
+            tf2.clear()
+            p2 = tf2.paragraphs[0]
+            r2 = p2.add_run()
+            r2.text = subtitle
+            r2.font.size = Pt(14)
+            r2.font.color.rgb = RGBColor(90, 90, 90)
+
+    def add_kpi_block(slide):
+        box = slide.shapes.add_textbox(Inches(0.7), Inches(1.6), Inches(5.8), Inches(2.8))
+        tf = box.text_frame
+        tf.clear()
+        tf.word_wrap = True
+
+        lines = [
+            f"Total tickets: {kpi['total']}",
+            f"Open: {kpi['open']}  ({kpi['open_pct']:.1f}%)",
+            f"Resolved: {kpi['resolved']}  ({kpi['resolved_pct']:.1f}%)",
+            f"Median open age: {_format_days(kpi['median_age_open'])}",
+            f"Median cycle time: {_format_days(kpi['median_cycle'])}",
+            f"Mean cycle time: {_format_days(kpi['mean_cycle'])}",
+        ]
+
+        p = tf.paragraphs[0]
+        r = p.add_run()
+        r.text = "Key Metrics"
+        r.font.size = Pt(18)
+        r.font.bold = True
+
+        for ln in lines:
+            p = tf.add_paragraph()
+            p.text = ln
+            p.level = 1
+            p.font.size = Pt(14)
+
+    def add_filters_block(slide):
+        box = slide.shapes.add_textbox(Inches(7.0), Inches(1.6), Inches(5.8), Inches(2.8))
+        tf = box.text_frame
+        tf.clear()
+        tf.word_wrap = True
+
+        p = tf.paragraphs[0]
+        r = p.add_run()
+        r.text = "Applied Filters"
+        r.font.size = Pt(18)
+        r.font.bold = True
+
+        for k, v in meta.items():
+            if not v:
+                continue
+            p = tf.add_paragraph()
+            p.text = f"{k}: {', '.join(v)}"
+            p.level = 1
+            p.font.size = Pt(12)
+
+    def add_fig_slide(title: str, fig: go.Figure):
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        add_title(slide, title)
+
+        img_bytes = _plotly_to_png_bytes(fig)
+        if not img_bytes:
+            # fallback note
+            note = slide.shapes.add_textbox(Inches(0.8), Inches(2.0), Inches(12.0), Inches(1.0))
+            note.text_frame.text = "Chart image export unavailable (install 'kaleido')."
+            return
+
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            tmp.write(img_bytes)
+            tmp_path = tmp.name
+
+        slide.shapes.add_picture(tmp_path, Inches(0.7), Inches(1.4), width=Inches(12.0))
+
+    def add_table_slide(title: str, df_table: pd.DataFrame, max_rows: int = 18):
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        add_title(slide, title)
+
+        if df_table is None or df_table.empty:
+            tb = slide.shapes.add_textbox(Inches(0.8), Inches(2.0), Inches(12.0), Inches(1.0))
+            tb.text_frame.text = "No rows to display."
+            return
+
+        t = df_table.copy().head(max_rows)
+        t.columns = [c.lstrip("_").replace("_", " ").title() for c in t.columns]
+
+        rows, cols = t.shape[0] + 1, t.shape[1]
+        left, top, width, height = Inches(0.7), Inches(1.4), Inches(12.0), Inches(5.6)
+        table = slide.shapes.add_table(rows, cols, left, top, width, height).table
+
+        # header
+        for j, col in enumerate(t.columns):
+            cell = table.cell(0, j)
+            cell.text = str(col)
+            for p in cell.text_frame.paragraphs:
+                for r in p.runs:
+                    r.font.bold = True
+                    r.font.size = Pt(11)
+
+        # body
+        for i in range(t.shape[0]):
+            for j in range(cols):
+                val = t.iloc[i, j]
+                if isinstance(val, pd.Timestamp):
+                    txt = val.strftime("%Y-%m-%d")
+                else:
+                    txt = "" if pd.isna(val) else str(val)
+                cell = table.cell(i + 1, j)
+                cell.text = txt
+                for p in cell.text_frame.paragraphs:
+                    for r in p.runs:
+                        r.font.size = Pt(10)
+
+    # Cover slide
+    slide0 = prs.slides.add_slide(prs.slide_layouts[6])
+    add_title(slide0, "JIRA Executive Report", f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    add_kpi_block(slide0)
+    add_filters_block(slide0)
+
+    # Charts
+    for name, fig in figs.items():
+        add_fig_slide(name, fig)
+
+    # Tables
+    add_table_slide("Oldest Open (Top 25)", tables.get("Oldest Open (Top 25)"))
+    add_table_slide("High Priority Open (Top 25)", tables.get("High Priority Open (Top 25)"))
+
+    # Export
+    out = io.BytesIO()
+    prs.save(out)
+    return out.getvalue()
+
+
+# -----------------------------
+# UI
+# -----------------------------
+st.title(APP_TITLE)
+st.caption(APP_SUBTITLE)
+
+uploaded = st.file_uploader("Upload JIRA CSV export", type=["csv"])
+
+with st.expander("What CSV exports work?", expanded=False):
+    st.write(
+        """
+        This tool auto-detects common Jira CSV export columns like:
+        - Issue key / Key, Summary, Status, Priority, Assignee, Issue Type, Project
+        - Created, Updated, Resolved (Resolution date)
+        - Labels, Components
+        It’s robust to missing columns — it will still produce a dashboard with what’s available.
+        """
+    )
+
+if not uploaded:
+    st.info("Upload a JIRA CSV to begin.")
+    st.stop()
+
+# Load data
+try:
+    raw = pd.read_csv(uploaded)
+except Exception:
+    uploaded.seek(0)
+    raw = pd.read_csv(uploaded, encoding_errors="ignore")
+
+if raw.empty:
+    st.error("CSV loaded but contains no rows.")
+    st.stop()
+
+cm = detect_columns(raw)
+df = normalize_dataframe(raw, cm)
+
+filtered, selections = apply_filters(df)
+
+kpi = kpis(filtered)
+
+# -----------------------------
+# KPI Row
+# -----------------------------
+c1, c2, c3, c4, c5, c6 = st.columns(6)
+c1.metric("Total", f"{kpi['total']}")
+c2.metric("Open", f"{kpi['open']}", f"{kpi['open_pct']:.1f}%")
+c3.metric("Resolved", f"{kpi['resolved']}", f"{kpi['resolved_pct']:.1f}%")
+c4.metric("Median open age", _format_days(kpi["median_age_open"]))
+c5.metric("Median cycle time", _format_days(kpi["median_cycle"]))
+c6.metric("Mean cycle time", _format_days(kpi["mean_cycle"]))
+
+st.divider()
+
+# -----------------------------
+# Charts Layout
+# -----------------------------
+left, right = st.columns(2)
+
+with left:
+    st.plotly_chart(chart_status(filtered), use_container_width=True)
+    st.plotly_chart(chart_created_vs_resolved(filtered), use_container_width=True)
+
+with right:
+    st.plotly_chart(chart_priority(filtered), use_container_width=True)
+    st.plotly_chart(chart_assignee_workload(filtered), use_container_width=True)
+
+st.plotly_chart(chart_aging_buckets(filtered), use_container_width=True)
+st.plotly_chart(chart_throughput(filtered), use_container_width=True)
+
+# -----------------------------
+# Exec Tables
+# -----------------------------
+st.subheader("Executive Tables")
+tables = make_exec_tables(filtered)
+
+tab_names = list(tables.keys())
+tabs = st.tabs(tab_names)
+
+for tname, tab in zip(tab_names, tabs):
+    with tab:
+        tdf = tables[tname]
+        if tdf is None or tdf.empty:
+            st.info("No rows to display.")
+        else:
+            show = tdf.copy()
+            show.columns = [c.lstrip("_").replace("_", " ").title() for c in show.columns]
+            st.dataframe(show, use_container_width=True, height=420)
+
+# -----------------------------
+# Raw Data (optional)
+# -----------------------------
+with st.expander("Raw data (filtered)"):
+    preview = filtered.copy()
+    # keep only the normalized-friendly columns + original columns
+    keep = ["_key", "_summary", "_project", "_issue_type", "_priority", "_status", "_assignee", "_created", "_resolved", "_age_days", "_cycle_days"]
+    keep = [c for c in keep if c in preview.columns]
+    st.dataframe(preview[keep].head(200), use_container_width=True)
+
+# -----------------------------
+# Exports
+# -----------------------------
+st.divider()
+st.subheader("Exports")
+
+excel_bytes = to_excel_bytes(tables=tables, meta=selections, kpi=kpi)
+st.download_button(
+    label="⬇️ Download Excel Summary (.xlsx)",
+    data=excel_bytes,
+    file_name=f"jira_exec_summary_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+)
+
+# PPT export
+figs_for_ppt = {
+    "Tickets by Status": chart_status(filtered),
+    "Tickets by Priority": chart_priority(filtered),
+    "Open Workload by Assignee": chart_assignee_workload(filtered),
+    "Created vs Resolved (Monthly)": chart_created_vs_resolved(filtered),
+    "Open Ticket Aging Buckets": chart_aging_buckets(filtered),
+    "Resolved Throughput (Weekly)": chart_throughput(filtered),
+}
+
+ppt_ready = PPTX_AVAILABLE and KALEIDO_AVAILABLE
+if ppt_ready:
+    ppt_bytes = to_pptx_bytes(meta=selections, kpi=kpi, figs=figs_for_ppt, tables=tables)
+    if ppt_bytes:
+        st.download_button(
+            label="⬇️ Download PowerPoint Exec Pack (.pptx)",
+            data=ppt_bytes,
+            file_name=f"jira_exec_pack_{datetime.now().strftime('%Y%m%d_%H%M')}.pptx",
+            mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        )
+    else:
+        st.warning("PowerPoint export failed to generate (unexpected).")
+else:
+    st.info(
+        "PowerPoint export is disabled. Install dependencies:\n\n"
+        "- pip install python-pptx kaleido\n"
+    )
+
+st.success("Dashboard generated successfully ✅")
